@@ -1,0 +1,832 @@
+# -*- coding: utf-8 -*-
+"""PbrView: en levende render av FreeCAD-dokumentet.
+
+Et eget vindu som viser det aktive dokumentet med en Principled-aktig
+BSDF, miljoebelysning, skyggekart og filmisk tonemapping. OpenGL 4.1
+kjerneprofil, tegnet i Qt sin egen GL-widget inne i FreeCADs prosess.
+
+Dette er en render, ikke en erstatning for viewporten. Du kan navigere
+i den, og navigasjonen styrer FreeCADs eget kamera slik at de to foelger
+hverandre. Du kan ikke velge, maale eller modellere: det finnes ingen
+plukking, og det er FreeCADs egen visning som skal gjoere den jobben.
+
+Kjoer makroen fra Macro-dialogen, eller:
+    exec(open("<denne fila>").read())
+    show()
+"""
+
+__Name__ = "PbrView"
+__Comment__ = ("Levende PBR-render av dokumentet, med skygger og "
+               "miljoebelysning, i et eget vindu")
+__Author__ = "Christian Leon"
+__Version__ = "0.1.0"
+__Date__ = "2026-09-18"
+__License__ = "MIT"
+__Web__ = "https://github.com/chrleon/freecad-pbrview"
+__Wiki__ = "https://github.com/chrleon/freecad-pbrview"
+__Icon__ = "PbrView.svg"
+__Help__ = "Aapne et dokument og kjoer makroen. Dra for aa rotere."
+__Status__ = "Alpha"
+__Requires__ = "FreeCAD >= 1.0"
+__Files__ = "PbrView.svg"
+
+import math
+
+import numpy as np
+
+import FreeCAD
+import FreeCADGui as Gui
+from pivy import coin
+from PySide6 import QtCore, QtGui, QtOpenGL, QtOpenGLWidgets
+
+TOLERANSE = 0.05        # tesselering, millimeter
+BAKGRUNN = (0.86, 0.87, 0.89)
+
+
+# --------------------------------------------------------------- shader
+
+VS = """#version 410 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNormal;
+uniform mat4 mvp;
+uniform mat3 normalMatrix;
+out vec3 vWorld;
+out vec3 vNormal;
+void main()
+{
+    vWorld = aPos;
+    vNormal = normalMatrix * aNormal;
+    gl_Position = mvp * vec4(aPos, 1.0);
+}
+"""
+
+FS = """#version 410 core
+in vec3 vWorld;
+in vec3 vNormal;
+out vec4 frag;
+
+uniform vec3 camPos;
+uniform vec3 baseColor;
+uniform float metallic;
+uniform float roughness;
+uniform float exposure;
+uniform float groundFade;   // 0 for modellen, radius for gulvet
+uniform vec3 groundCenter;
+
+// FreeCAD er Z-opp. Solen og miljoeet maa foelge samme akse, ellers
+// kommer lyset fra siden og modellen ser feil ut uten at man skjoenner
+// hvorfor.
+uniform vec3 sunDir;
+uniform sampler2D shadowMap;
+uniform mat4 lightMvp;
+uniform vec3 lightPos;
+uniform float shadowTexel;
+
+const vec3 UP = vec3(0.0, 0.0, 1.0);
+const float PI = 3.14159265;
+#define SUN sunDir
+
+vec3 env(vec3 d)
+{
+    float up = clamp(dot(d, UP), -1.0, 1.0);
+    vec3 sky = mix(vec3(0.42, 0.48, 0.60), vec3(0.80, 0.87, 1.00),
+                   smoothstep(0.0, 0.85, up));
+    vec3 ground = mix(vec3(0.10, 0.10, 0.11), vec3(0.34, 0.33, 0.32),
+                      smoothstep(-1.0, -0.05, up));
+    vec3 c = mix(ground, sky, smoothstep(-0.03, 0.06, up));
+    c += vec3(1.0, 0.95, 0.88) * pow(max(dot(d, SUN), 0.0), 1200.0) * 26.0;
+    c += vec3(1.0, 0.96, 0.90) * pow(max(dot(d, SUN), 0.0), 36.0) * 0.30;
+    return c;
+}
+
+vec3 envBlur(vec3 d, float r)
+{
+    vec3 sharp = env(d);
+    if (r < 0.04) return sharp;
+    vec3 w = env(normalize(d + vec3(0.5, 0, 0))) + env(normalize(d - vec3(0.5, 0, 0)))
+           + env(normalize(d + vec3(0, 0.5, 0))) + env(normalize(d - vec3(0, 0.5, 0)))
+           + env(normalize(d + vec3(0, 0, 0.5))) + env(normalize(d - vec3(0, 0, 0.5)));
+    return mix(sharp, w / 6.0, clamp(r * 1.15, 0.0, 1.0));
+}
+
+float D_GGX(float NoH, float a)
+{
+    float a2 = a * a;
+    float d = NoH * NoH * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d);
+}
+float V_Smith(float NoV, float NoL, float a)
+{
+    float a2 = a * a;
+    float gv = NoL * sqrt(NoV * NoV * (1.0 - a2) + a2);
+    float gl = NoV * sqrt(NoL * NoL * (1.0 - a2) + a2);
+    return 0.5 / max(gv + gl, 1e-5);
+}
+vec3 F_Schlick(vec3 f0, float u)
+{
+    return f0 + (1.0 - f0) * pow(1.0 - u, 5.0);
+}
+
+// Skyggekartet lagrer avstand fra lyset, ikke dybde i klippkoordinater.
+// Lineaer avstand gjoer sammenligningen enkel og skjevheten forutsigbar.
+float shadowFactor(vec3 world, float NoL)
+{
+    vec4 lp = lightMvp * vec4(world, 1.0);
+    vec3 ndc = lp.xyz / lp.w;
+    vec2 uv = ndc.xy * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
+
+    float dist = length(world - lightPos);
+    // Skjevheten skaleres med hvor skraatt lyset treffer. Uten det faar
+    // flater som vender bort fra lyset en stripete selvskygge.
+    float bias = 0.015 + 0.12 * (1.0 - NoL);
+
+    float sum = 0.0;
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            float lagret = texture(shadowMap,
+                                   uv + vec2(x, y) * shadowTexel).r;
+            sum += (lagret < dist - bias) ? 0.0 : 1.0;
+        }
+    }
+    return sum / 9.0;
+}
+
+vec3 tonemap(vec3 x)
+{
+    x = max(x * exposure, 0.0);
+    x = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
+    return pow(clamp(x, 0.0, 1.0), vec3(1.0 / 2.2));
+}
+
+void main()
+{
+    vec3 n = normalize(vNormal);
+    vec3 v = normalize(camPos - vWorld);
+    // Tesselerte CAD-flater kan ha normaler som peker bort fra kameraet
+    // paa baksiden av tynne partier. Snu dem, ellers blir de sorte.
+    if (dot(n, v) < 0.0) n = -n;
+
+    float a = max(roughness * roughness, 0.0015);
+    vec3 f0 = mix(vec3(0.04), baseColor, metallic);
+    vec3 diffCol = baseColor * (1.0 - metallic);
+
+    vec3 l = SUN;
+    vec3 h = normalize(l + v);
+    float NoL = max(dot(n, l), 0.0);
+    float NoV = max(dot(n, v), 1e-4);
+    float NoH = max(dot(n, h), 0.0);
+    float VoH = max(dot(v, h), 0.0);
+
+    vec3 sun = vec3(1.0, 0.97, 0.92) * 2.6 * NoL * shadowFactor(vWorld, NoL);
+    vec3 direct = (diffCol / PI
+                   + F_Schlick(f0, VoH) * D_GGX(NoH, a) * V_Smith(NoV, NoL, a))
+                  * sun;
+
+    vec3 ambient = diffCol * envBlur(n, 1.0) * 0.60
+                 + envBlur(reflect(-v, n), roughness) * F_Schlick(f0, NoV);
+
+    vec3 farge = tonemap(direct + ambient);
+
+    // Gulvplanet er en endelig firkant. Uten uttoning ser man kanten av
+    // den som en rett strek tvers over bildet.
+    if (groundFade > 0.0) {
+        float d = length(vWorld.xy - groundCenter.xy) / groundFade;
+        farge = mix(farge, tonemap(envBlur(normalize(vWorld - camPos), 0.5)),
+                    smoothstep(0.45, 1.0, d));
+    }
+    frag = vec4(farge, 1.0);
+}
+"""
+
+
+SKY_VS = """#version 410 core
+const vec2 P[3] = vec2[3](vec2(-1,-1), vec2(3,-1), vec2(-1,3));
+out vec2 ndc;
+void main(){ ndc = P[gl_VertexID]; gl_Position = vec4(P[gl_VertexID], 1.0, 1.0); }
+"""
+
+SKY_FS = """#version 410 core
+in vec2 ndc; out vec4 frag;
+uniform mat4 invViewProj;
+uniform vec3 camPos;
+uniform vec3 sunDir;
+uniform float exposure;
+const vec3 UP = vec3(0.0, 0.0, 1.0);
+
+vec3 env(vec3 d)
+{
+    float up = clamp(dot(d, UP), -1.0, 1.0);
+    vec3 sky = mix(vec3(0.42, 0.48, 0.60), vec3(0.80, 0.87, 1.00),
+                   smoothstep(0.0, 0.85, up));
+    vec3 ground = mix(vec3(0.10, 0.10, 0.11), vec3(0.34, 0.33, 0.32),
+                      smoothstep(-1.0, -0.05, up));
+    vec3 c = mix(ground, sky, smoothstep(-0.03, 0.06, up));
+    c += vec3(1.0, 0.95, 0.88) * pow(max(dot(d, sunDir), 0.0), 1200.0) * 26.0;
+    c += vec3(1.0, 0.96, 0.90) * pow(max(dot(d, sunDir), 0.0), 36.0) * 0.30;
+    return c;
+}
+
+void main()
+{
+    // Bakgrunnen maa komme fra samme miljoe som speilingene, ellers ser
+    // man overgangen mellom gulvet og himmelen som en strek.
+    vec4 nr = invViewProj * vec4(ndc, -1.0, 1.0);
+    vec4 fr = invViewProj * vec4(ndc, 1.0, 1.0);
+    vec3 d = normalize(fr.xyz / fr.w - nr.xyz / nr.w);
+    vec3 c = env(d);
+    // litt uskarphet, saa solskiven ikke blir en hard prikk
+    c = mix(c, vec3(dot(c, vec3(0.33))), 0.10);
+    c = max(c * exposure, 0.0);
+    c = (c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14);
+    frag = vec4(pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
+}
+"""
+
+
+SHADOW_VS = """#version 410 core
+layout(location = 0) in vec3 aPos;
+uniform mat4 lightMvp;
+out vec3 vWorld;
+void main()
+{
+    vWorld = aPos;
+    gl_Position = lightMvp * vec4(aPos, 1.0);
+}
+"""
+
+SHADOW_FS = """#version 410 core
+in vec3 vWorld;
+uniform vec3 lightPos;
+out vec4 frag;
+void main()
+{
+    // Avstand til lyset, ikke dybde. Lagres i en flyttallstekstur, for
+    // aatte bits ville gitt trappetrinn i skyggekanten.
+    frag = vec4(length(vWorld - lightPos), 0.0, 0.0, 1.0);
+}
+"""
+
+SKYGGE_STR = 2048       # oppløsning på skyggekartet
+SOLRETNING = (-0.45, -0.35, 0.82)
+
+
+# ------------------------------------------------------------ geometri
+
+def tessellate(obj, tol=TOLERANSE):
+    """Trekanter med normaler fra en FreeCAD-form.
+
+    Normalene midles per flate, ikke over hele modellen. Det er nettopp
+    riktig for CAD: en sylinder er én flate og blir jevn, mens moetet
+    mellom to flater forblir en skarp kant. Midler man over alt, ser
+    faste kanter avrundede ut.
+    """
+    shape = getattr(obj, "Shape", None)
+    if shape is None:
+        return None
+    placement = obj.Placement
+
+    alle_pos, alle_nrm, alle_idx = [], [], []
+    base = 0
+    for face in shape.Faces:
+        try:
+            pts, tris = face.tessellate(tol)
+        except Exception:
+            continue
+        if not pts or not tris:
+            continue
+        pos = np.array([[p.x, p.y, p.z] for p in pts], dtype=np.float64)
+        nrm = np.zeros_like(pos)
+        idx = np.array(tris, dtype=np.int64)
+
+        e1 = pos[idx[:, 1]] - pos[idx[:, 0]]
+        e2 = pos[idx[:, 2]] - pos[idx[:, 0]]
+        fn = np.cross(e1, e2)
+        for k in range(3):
+            np.add.at(nrm, idx[:, k], fn)
+
+        lengths = np.linalg.norm(nrm, axis=1)
+        lengths[lengths == 0.0] = 1.0
+        nrm /= lengths[:, None]
+        if str(face.Orientation) == "Reversed":
+            nrm = -nrm
+            idx = idx[:, ::-1]
+
+        alle_pos.append(pos)
+        alle_nrm.append(nrm)
+        alle_idx.append(idx + base)
+        base += len(pos)
+
+    if not alle_pos:
+        return None
+
+    pos = np.concatenate(alle_pos)
+    nrm = np.concatenate(alle_nrm)
+    idx = np.concatenate(alle_idx)
+
+    # Plasseringen bakes inn i punktene. Med ett objekt er det enklere
+    # enn en modellmatrise per tegning.
+    if not placement.isIdentity():
+        m = placement.Matrix
+        rot = np.array([[m.A11, m.A12, m.A13],
+                        [m.A21, m.A22, m.A23],
+                        [m.A31, m.A32, m.A33]])
+        off = np.array([m.A14, m.A24, m.A34])
+        pos = pos @ rot.T + off
+        nrm = nrm @ rot.T
+
+    flat = idx.ravel()
+    return (pos[flat].astype(np.float32), nrm[flat].astype(np.float32))
+
+
+def ground_plane(bbox, vekst=3.0):
+    """Et gulv under modellen, saa den staar paa noe."""
+    cx = 0.5 * (bbox.XMin + bbox.XMax)
+    cy = 0.5 * (bbox.YMin + bbox.YMax)
+    r = max(bbox.XLength, bbox.YLength) * vekst + 1.0
+    z = bbox.ZMin
+    hjorner = np.array([[cx - r, cy - r, z], [cx + r, cy - r, z],
+                        [cx + r, cy + r, z], [cx - r, cy + r, z]],
+                       dtype=np.float32)
+    pos = hjorner[[0, 1, 2, 0, 2, 3]]
+    nrm = np.tile(np.array([0, 0, 1], dtype=np.float32), (6, 1))
+    return pos, nrm
+
+
+# ---------------------------------------------------------------- kamera
+
+def camera_from_freecad(view, aspect, senter=None, radius=None):
+    """Bygger view- og projeksjonsmatrise fra Coins kamera.
+
+    Klippeplanene regnes ut paa nytt, ikke hentet fra FreeCAD. FreeCAD
+    setter dem tett rundt modellen, og gulvplanet vaart stikker langt
+    utenfor. Da skjaerer det bakre klippeplanet tvers gjennom gulvet, og
+    resultatet ser ut som en horisont man ikke har bedt om.
+    """
+    cam = view.getCameraNode()
+    p = cam.position.getValue().getValue()
+    pos = QtGui.QVector3D(p[0], p[1], p[2])
+    rot = cam.orientation.getValue()
+    # coin importeres oeverst i fila. __import__("pivy").coin gir ikke
+    # undermodulen, og feilen kommer som "No SWIG wrapped library loaded",
+    # som peker et helt annet sted enn aarsaken.
+    fwd = QtGui.QVector3D(*rot.multVec(coin.SbVec3f(0, 0, -1)).getValue())
+    up = QtGui.QVector3D(*rot.multVec(coin.SbVec3f(0, 1, 0)).getValue())
+
+    near = max(cam.nearDistance.getValue(), 1e-3)
+    far = max(cam.farDistance.getValue(), near + 1.0)
+    if senter is not None and radius:
+        mot = senter - pos
+        avstand = QtGui.QVector3D.dotProduct(mot, fwd.normalized())
+        near = max(avstand - radius * 1.5, 1e-3)
+        far = avstand + radius * 3.0
+
+    proj = QtGui.QMatrix4x4()
+    if hasattr(cam, "heightAngle"):
+        proj.perspective(math.degrees(cam.heightAngle.getValue()),
+                         aspect, near, far)
+    else:
+        half = cam.height.getValue() * 0.5
+        proj.ortho(-half * aspect, half * aspect, -half, half, near, far)
+
+    viewm = QtGui.QMatrix4x4()
+    viewm.lookAt(pos, pos + fwd, up)
+    return proj, viewm, pos
+
+
+def light_matrix(bbox, sun):
+    """Ortografisk projeksjon fra lyset som dekker hele modellen.
+
+    Boksen maa favne alt som kaster skygge. For trang, og deler av
+    modellen faller utenfor og slutter aa kaste skygge midt i bildet.
+    """
+    cx = 0.5 * (bbox.XMin + bbox.XMax)
+    cy = 0.5 * (bbox.YMin + bbox.YMax)
+    cz = 0.5 * (bbox.ZMin + bbox.ZMax)
+    senter = QtGui.QVector3D(cx, cy, cz)
+    r = 0.5 * math.sqrt(bbox.XLength ** 2 + bbox.YLength ** 2
+                        + bbox.ZLength ** 2)
+    r = max(r, 1.0) * 1.15
+
+    s = QtGui.QVector3D(*sun).normalized()
+    lyspos = senter + s * (r * 3.0)
+
+    # Opp-vektoren maa ikke vaere parallell med lysretningen, ellers
+    # kollapser lookAt til en degenerert matrise.
+    opp = QtGui.QVector3D(0, 0, 1)
+    if abs(QtGui.QVector3D.dotProduct(opp, s)) > 0.98:
+        opp = QtGui.QVector3D(0, 1, 0)
+
+    proj = QtGui.QMatrix4x4()
+    proj.ortho(-r, r, -r, r, 0.05, r * 6.0)
+    view = QtGui.QMatrix4x4()
+    view.lookAt(lyspos, senter, opp)
+    return proj * view, lyspos
+
+
+# --------------------------------------------------------------- vindu
+
+class PbrViewport(QtOpenGLWidgets.QOpenGLWidget):
+
+    def __init__(self):
+        super(PbrViewport, self).__init__()
+        f = QtGui.QSurfaceFormat()
+        f.setVersion(4, 1)
+        f.setProfile(QtGui.QSurfaceFormat.CoreProfile)
+        f.setDepthBufferSize(24)
+        f.setSamples(4)
+        self.setFormat(f)
+        self.setWindowTitle("FreeCAD PBR-visning")
+        self.ok = False
+        self.meshes = []          # (vao, antall indekser, materiale)
+        self.pending = []         # geometri som venter paa GL-konteksten
+        self.exposure = 0.45
+        self.feil = None
+        self.ground_center = QtGui.QVector3D(0, 0, 0)
+        self.ground_radius = 0.0
+        self._sist = None
+        self._knapp = None
+        self._sist_kamera = None
+        self.setMouseTracking(False)
+        # Poller kameraet i stedet for aa hekte oss paa Coin. En
+        # sensor-callback fra Coin ville kalt Python fra tegneloekka, og
+        # den veien har allerede kostet oss en krasj i dag.
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(33)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+    # -- oppbygging ----------------------------------------------------
+
+    def load_document(self, doc=None):
+        doc = doc or FreeCAD.ActiveDocument
+        if doc is None:
+            return 0
+        self.pending = []
+        bbox = None
+        antall = 0
+        for obj in doc.Objects:
+            if obj.TypeId.startswith("App::") or not hasattr(obj, "Shape"):
+                continue
+            if not getattr(obj.ViewObject, "Visibility", False):
+                continue
+            data = tessellate(obj)
+            if data is None:
+                continue
+            farge = tuple(obj.ViewObject.ShapeColor[:3])
+            self.pending.append((data, farge, 0.0, 0.45))
+            bbox = obj.Shape.BoundBox if bbox is None else bbox
+            antall += 1
+        if bbox is not None:
+            self.pending.append((ground_plane(bbox), (0.62, 0.62, 0.63),
+                                 0.0, 0.7))
+            self.ground_center = QtGui.QVector3D(
+                0.5 * (bbox.XMin + bbox.XMax),
+                0.5 * (bbox.YMin + bbox.YMax), bbox.ZMin)
+            self.ground_radius = max(bbox.XLength, bbox.YLength) * 3.0 + 1.0
+        self.bbox = bbox
+        return antall
+
+    def _upload(self, data):
+        """Laster geometri til GPU-en.
+
+        setAttributeBuffer i stedet for glVertexAttribPointer: den siste
+        tar en raa peker som siste argument, og den finnes det ingen god
+        oversettelse av fra Python. Qt sin variant tar et heltalls
+        forskyvning og gjoer det samme.
+        """
+        pos, nrm = data
+        GL_FLOAT = 0x1406
+
+        vao = QtOpenGL.QOpenGLVertexArrayObject()
+        vao.create()
+        vao.bind()
+
+        self.prog.bind()
+
+        vbo_p = QtOpenGL.QOpenGLBuffer(QtOpenGL.QOpenGLBuffer.VertexBuffer)
+        vbo_p.create(); vbo_p.bind()
+        vbo_p.allocate(pos.tobytes(), int(pos.nbytes))
+        self.prog.enableAttributeArray(0)
+        self.prog.setAttributeBuffer(0, GL_FLOAT, 0, 3, 0)
+
+        vbo_n = QtOpenGL.QOpenGLBuffer(QtOpenGL.QOpenGLBuffer.VertexBuffer)
+        vbo_n.create(); vbo_n.bind()
+        vbo_n.allocate(nrm.tobytes(), int(nrm.nbytes))
+        self.prog.enableAttributeArray(1)
+        self.prog.setAttributeBuffer(1, GL_FLOAT, 0, 3, 0)
+
+        vao.release()
+        self.prog.release()
+        # Bufferne maa holdes i live; ellers rydder Python dem bort og
+        # tegningen blir tom uten at OpenGL klager.
+        return (vao, len(pos), vbo_p, vbo_n)
+
+    # -- GL ------------------------------------------------------------
+
+    def initializeGL(self):
+        try:
+            self._initializeGL()
+        except Exception as exc:
+            import traceback
+            self.feil = traceback.format_exc()
+            print('initializeGL feilet:\n' + self.feil)
+
+    def _initializeGL(self):
+        self.gl = QtGui.QOpenGLExtraFunctions(self.context())
+        p = QtOpenGL.QOpenGLShaderProgram()
+        p.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.Vertex, VS)
+        p.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.Fragment, FS)
+        self.ok = p.link()
+        if not self.ok:
+            print("shader feilet:", p.log())
+            return
+        self.prog = p
+        self.loc = {n: p.uniformLocation(n) for n in
+                    ("mvp", "normalMatrix", "camPos", "baseColor",
+                     "metallic", "roughness", "exposure", "sunDir",
+                     "groundFade", "groundCenter",
+                     "shadowMap", "lightMvp", "lightPos", "shadowTexel")}
+
+        sp = QtOpenGL.QOpenGLShaderProgram()
+        sp.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.Vertex, SHADOW_VS)
+        sp.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.Fragment, SHADOW_FS)
+        if not sp.link():
+            print("skyggeshader feilet:", sp.log())
+            self.ok = False
+            return
+        self.shadow_prog = sp
+        self.shadow_loc = {n: sp.uniformLocation(n)
+                           for n in ("lightMvp", "lightPos")}
+
+        kp = QtOpenGL.QOpenGLShaderProgram()
+        kp.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.Vertex, SKY_VS)
+        kp.addShaderFromSourceCode(QtOpenGL.QOpenGLShader.Fragment, SKY_FS)
+        if not kp.link():
+            print("himmelshader feilet:", kp.log())
+            self.ok = False
+            return
+        self.sky_prog = kp
+        self.sky_loc = {n: kp.uniformLocation(n)
+                        for n in ("invViewProj", "camPos", "sunDir",
+                                  "exposure")}
+        self.sky_vao = QtOpenGL.QOpenGLVertexArrayObject()
+        self.sky_vao.create()
+
+        fmt = QtOpenGL.QOpenGLFramebufferObjectFormat()
+        fmt.setAttachment(QtOpenGL.QOpenGLFramebufferObject.Depth)
+        fmt.setInternalTextureFormat(0x822E)      # GL_R32F
+        self.shadow_fbo = QtOpenGL.QOpenGLFramebufferObject(
+            SKYGGE_STR, SKYGGE_STR, fmt)
+        print("skyggekart:", self.shadow_fbo.isValid(),
+              self.shadow_fbo.width(), "x", self.shadow_fbo.height())
+
+        self.gl.glEnable(0x0B71)      # GL_DEPTH_TEST
+        self._flush_pending()
+
+    def _flush_pending(self):
+        for data, farge, met, rgh in self.pending:
+            self.meshes.append((self._upload(data), farge, met, rgh))
+        self.pending = []
+
+    # -- navigasjon ----------------------------------------------------
+
+    def _camera(self):
+        return Gui.activeDocument().activeView().getCameraNode()
+
+    def mousePressEvent(self, ev):
+        self._sist = ev.position()
+        self._knapp = ev.button()
+
+    def mouseMoveEvent(self, ev):
+        if self._sist is None:
+            return
+        p = ev.position()
+        dx = p.x() - self._sist.x()
+        dy = p.y() - self._sist.y()
+        self._sist = p
+        try:
+            cam = self._camera()
+            mods = ev.modifiers()
+            if (self._knapp == QtCore.Qt.MiddleButton
+                    or mods & QtCore.Qt.ShiftModifier):
+                skala = (cam.height.getValue() if hasattr(cam, "height")
+                         else cam.focalDistance.getValue()) / max(self.height(), 1)
+                _pan(cam, dx, dy, skala)
+            else:
+                _orbit(cam, dx, dy)
+        except Exception:
+            return
+        self.update()
+        Gui.activeDocument().activeView().redraw()
+
+    def mouseReleaseEvent(self, ev):
+        self._sist = None
+
+    def wheelEvent(self, ev):
+        try:
+            _zoom(self._camera(), ev.angleDelta().y() / 120.0)
+        except Exception:
+            return
+        self.update()
+        Gui.activeDocument().activeView().redraw()
+
+    def _tick(self):
+        """Tegner paa nytt bare naar FreeCADs kamera faktisk har flyttet seg."""
+        try:
+            cam = self._camera()
+            n = (tuple(cam.position.getValue().getValue())
+                 + tuple(cam.orientation.getValue().getValue())
+                 + (cam.height.getValue() if hasattr(cam, "height")
+                    else cam.heightAngle.getValue(),))
+        except Exception:
+            return
+        if n != self._sist_kamera:
+            self._sist_kamera = n
+            self.update()
+
+    def _shadow_pass(self, light_mvp, light_pos):
+        """Tegner scenen sett fra lyset, inn i skyggekartet."""
+        self.shadow_fbo.bind()
+        self.gl.glViewport(0, 0, SKYGGE_STR, SKYGGE_STR)
+        # Bakgrunnen maa vaere langt unna, ellers ligger det en skygge
+        # over alt som skyggekartet ikke dekker.
+        self.gl.glClearColor(1e6, 0.0, 0.0, 1.0)
+        self.gl.glClear(0x4000 | 0x100)
+
+        # Tegn baksidene i skyggepasset. Da havner skyggeakne paa
+        # flatene vi ikke ser, i stedet for paa dem vi ser.
+        self.gl.glEnable(0x0B44)            # GL_CULL_FACE
+        self.gl.glCullFace(0x0404)          # GL_FRONT
+
+        self.shadow_prog.bind()
+        self.shadow_prog.setUniformValue(self.shadow_loc["lightMvp"], light_mvp)
+        self.shadow_prog.setUniformValue(self.shadow_loc["lightPos"], light_pos)
+        for (vao, n, _a, _b), _farge, _met, _rgh in self.meshes[:-1]:
+            vao.bind()
+            self.gl.glDrawArrays(0x0004, 0, n)
+            vao.release()
+        self.shadow_prog.release()
+
+        self.gl.glDisable(0x0B44)
+        self.shadow_fbo.release()
+
+        # QOpenGLWidget tegner ikke til rammebuffer 0, men til sitt eget.
+        # release() binder 0, og uten dette blir vinduet staaende tomt.
+        self.gl.glBindFramebuffer(0x8D40, self.defaultFramebufferObject())
+        r = self.devicePixelRatioF()
+        self.gl.glViewport(0, 0, int(self.width() * r), int(self.height() * r))
+
+    def paintGL(self):
+        try:
+            self._paintGL()
+        except Exception:
+            import traceback
+            if not self.feil:
+                self.feil = traceback.format_exc()
+                print('paintGL feilet:\n' + self.feil)
+
+    def _paintGL(self):
+        self.gl.glClearColor(BAKGRUNN[0], BAKGRUNN[1], BAKGRUNN[2], 1.0)
+        self.gl.glClear(0x4000 | 0x100)
+        if not self.ok or not self.meshes:
+            return
+        if self.pending:
+            self._flush_pending()
+
+        light_mvp, light_pos = light_matrix(self.bbox, SOLRETNING)
+        self._shadow_pass(light_mvp, light_pos)
+
+        aspect = max(self.width(), 1) / float(max(self.height(), 1))
+        view3d = Gui.activeDocument().activeView()
+        proj, viewm, campos = camera_from_freecad(
+            view3d, aspect, self.ground_center, self.ground_radius)
+
+        mvp = proj * viewm
+        nm = viewm.normalMatrix()
+        nm.setToIdentity()            # verdensrom-normaler, ingen modellmatrise
+
+        # Himmelen foerst, uten dybdeskriving, saa geometrien tegnes oppaa.
+        sol = QtGui.QVector3D(*SOLRETNING).normalized()
+        inv, ok = mvp.inverted()
+        if ok:
+            self.gl.glDepthMask(False)
+            self.sky_prog.bind()
+            self.sky_prog.setUniformValue(self.sky_loc["invViewProj"], inv)
+            self.sky_prog.setUniformValue(self.sky_loc["camPos"], campos)
+            self.sky_prog.setUniformValue(self.sky_loc["sunDir"], sol)
+            self.sky_prog.setUniformValue1f(self.sky_loc["exposure"],
+                                            float(self.exposure))
+            self.sky_vao.bind()
+            self.gl.glDrawArrays(0x0004, 0, 3)
+            self.sky_vao.release()
+            self.sky_prog.release()
+            self.gl.glDepthMask(True)
+
+        self.prog.bind()
+        self.gl.glActiveTexture(0x84C0)                  # GL_TEXTURE0
+        self.gl.glBindTexture(0x0DE1, self.shadow_fbo.texture())
+        self.prog.setUniformValue1i(self.loc["shadowMap"], 0)
+        self.prog.setUniformValue(self.loc["lightMvp"], light_mvp)
+        self.prog.setUniformValue(self.loc["lightPos"], light_pos)
+        self.prog.setUniformValue1f(self.loc["shadowTexel"],
+                                    1.0 / float(SKYGGE_STR))
+        self.prog.setUniformValue(self.loc["sunDir"],
+                                  QtGui.QVector3D(*SOLRETNING).normalized())
+        self.prog.setUniformValue(self.loc["mvp"], mvp)
+        self.prog.setUniformValue(self.loc["normalMatrix"], nm)
+        self.prog.setUniformValue(self.loc["camPos"], campos)
+        self.prog.setUniformValue1f(self.loc["exposure"], float(self.exposure))
+
+        siste = len(self.meshes) - 1
+        for i, ((vao, n, _a, _b), farge, met, rgh) in enumerate(self.meshes):
+            er_gulv = (i == siste)
+            self.prog.setUniformValue1f(
+                self.loc["groundFade"],
+                float(self.ground_radius) if er_gulv else 0.0)
+            self.prog.setUniformValue(self.loc["groundCenter"],
+                                      self.ground_center)
+            self.prog.setUniformValue(self.loc["baseColor"],
+                                      QtGui.QVector3D(*farge))
+            self.prog.setUniformValue1f(self.loc["metallic"], float(met))
+            self.prog.setUniformValue1f(self.loc["roughness"], float(rgh))
+            vao.bind()
+            self.gl.glDrawArrays(0x0004, 0, n)
+            vao.release()
+        self.prog.release()
+
+
+# ----------------------------------------------------------- navigasjon
+
+def _orbit(cam, dx, dy):
+    """Dreier FreeCADs kamera rundt fokuspunktet.
+
+    Vi endrer FreeCADs eget kamera, ikke et lokalt. Da holder de to
+    vinduene seg synkrone av seg selv, og navigasjonen her virker ogsaa
+    i FreeCADs visning.
+    """
+    rot = cam.orientation.getValue()
+    pos = FreeCAD.Vector(*cam.position.getValue().getValue())
+    fwd = coin.SbVec3f(0, 0, -1)
+    retning = FreeCAD.Vector(*rot.multVec(fwd).getValue())
+    fokus = pos + retning * cam.focalDistance.getValue()
+
+    hoyre = FreeCAD.Vector(*rot.multVec(coin.SbVec3f(1, 0, 0)).getValue())
+
+    gir = coin.SbRotation(coin.SbVec3f(0, 0, 1), -dx * 0.01)
+    stig = coin.SbRotation(coin.SbVec3f(hoyre.x, hoyre.y, hoyre.z),
+                           -dy * 0.01)
+    total = gir * stig
+
+    ny_rot = total * rot
+    arm = pos - fokus
+    arm_rotert = total.multVec(coin.SbVec3f(arm.x, arm.y, arm.z)).getValue()
+    ny_pos = fokus + FreeCAD.Vector(*arm_rotert)
+
+    cam.orientation.setValue(ny_rot)
+    cam.position.setValue(coin.SbVec3f(ny_pos.x, ny_pos.y, ny_pos.z))
+
+
+def _pan(cam, dx, dy, skala):
+    rot = cam.orientation.getValue()
+    hoyre = FreeCAD.Vector(*rot.multVec(coin.SbVec3f(1, 0, 0)).getValue())
+    opp = FreeCAD.Vector(*rot.multVec(coin.SbVec3f(0, 1, 0)).getValue())
+    pos = FreeCAD.Vector(*cam.position.getValue().getValue())
+    ny = pos - hoyre * (dx * skala) + opp * (dy * skala)
+    cam.position.setValue(coin.SbVec3f(ny.x, ny.y, ny.z))
+
+
+def _zoom(cam, steg):
+    if hasattr(cam, "height"):
+        h = cam.height.getValue() * (0.9 ** steg)
+        cam.height.setValue(max(h, 1e-4))
+    else:
+        rot = cam.orientation.getValue()
+        retning = FreeCAD.Vector(*rot.multVec(coin.SbVec3f(0, 0, -1)).getValue())
+        pos = FreeCAD.Vector(*cam.position.getValue().getValue())
+        d = cam.focalDistance.getValue()
+        flytt = d * (1.0 - 0.9 ** steg)
+        ny = pos + retning * flytt
+        cam.position.setValue(coin.SbVec3f(ny.x, ny.y, ny.z))
+        cam.focalDistance.setValue(max(d - flytt, 1e-3))
+
+
+def show(doc=None):
+    global _pbr_viewport
+    try:
+        _pbr_viewport.close()
+    except Exception:
+        pass
+    _pbr_viewport = PbrViewport()
+    n = _pbr_viewport.load_document(doc)
+    _pbr_viewport.resize(900, 620)
+    _pbr_viewport.show()
+    print("lastet %d objekt(er)" % n)
+    return _pbr_viewport
+
+
+_pbr_viewport = None
+
+
+if __name__ == "__main__":
+    show()

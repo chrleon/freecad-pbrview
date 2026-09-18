@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"
+     viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="himmel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#cfd8e6"/>
+      <stop offset="55%" stop-color="#a8b3c2"/>
+      <stop offset="55%" stop-color="#7e8590"/>
+      <stop offset="100%" stop-color="#5c626b"/>
+    </linearGradient>
+    <radialGradient id="kule" cx="36%" cy="30%" r="76%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="38%" stop-color="#cdd5e0"/>
+      <stop offset="100%" stop-color="#3e444d"/>
+    </radialGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="9" fill="url(#himmel)"/>
+  <!-- kastskyggen er hele poenget med denne, saa den skal med -->
+  <ellipse cx="38" cy="45" rx="17" ry="5" fill="#2b3037" opacity="0.30"/>
+  <circle cx="28" cy="33" r="14" fill="url(#kule)"/>
+  <rect x="2" y="2" width="60" height="60" rx="9" fill="none"
+        stroke="#2b3037" stroke-width="1.5" opacity="0.5"/>
+</svg>
