@@ -37,6 +37,24 @@ midtknappen for å panorere, rull for å zoome.
 | Tesselering og opplasting | 2,5 s |
 | Bilde | 12,4 ms, altså 80 per sekund |
 
+## Materialer fra MatCap
+
+Velger du et materiale i [MatCap](https://github.com/chrleon/freecad-matcap),
+skriver den navnet til egenskapen `MatCapMaterial` på objektet, og den
+lagres i FCStd-fila. PbrView leser navnet og slår opp PBR-parametrene.
+
+**Oppslaget er eksakt, ikke et anslag.** Matcap-teksturene ble generert
+fra nettopp disse tallene, så teksturen og denne rendringen er to
+avbildninger av samme materiale. `metal_steel` er grunnfarge 0,70 / 0,72 /
+0,75 med metallverdi 1,0 og ruhet 0,30, begge steder.
+
+To unntak. Blenders to teksturer har ingen oppskrift å hente tall fra, så
+de er lest av teksturene og er anslag. De trinnvise materialene har ingen
+fysisk ekvivalent, og gjengis som matt maling i grunnfargen.
+
+Uten MatCap brukes objektets egen `ShapeColor` med nøytrale verdier. De to
+verktøyene kjenner ikke hverandre; de er bare enige om et navn.
+
 ## Hvordan det virker
 
 **Normalene midles per flate, ikke over hele modellen.** Det er nettopp

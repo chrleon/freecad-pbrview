@@ -40,6 +40,37 @@ from pivy import coin
 from PySide6 import QtCore, QtGui, QtOpenGL, QtOpenGLWidgets
 
 TOLERANSE = 0.05        # tesselering, millimeter
+
+# Materialene fra MatCap-addonen, som PBR-parametre.
+#
+# Dette er ikke gjetninger etter oeyemaal: matcap-teksturene ble
+# generert fra nettopp disse tallene. Teksturen og denne rendringen er
+# derfor to avbildninger av samme materiale, ikke to tolkninger av det.
+#
+# MatCap skriver navnet til egenskapen MatCapMaterial paa objektet, og
+# den lagres i FCStd-fila. De to verktoeyene trenger ikke kjenne
+# hverandre, bare bli enige om et navn.
+MATERIALER = {
+    "metal_steel":  ((0.70, 0.72, 0.75), 1.00, 0.30),
+    "metal_dark":   ((0.44, 0.45, 0.48), 1.00, 0.22),
+    "clay_light":   ((0.80, 0.78, 0.75), 0.00, 0.90),
+    "clay_warm":    ((0.78, 0.68, 0.58), 0.00, 0.90),
+    "plast_grey":   ((0.74, 0.75, 0.77), 0.05, 0.55),
+    "plast_cream":  ((0.91, 0.87, 0.78), 0.00, 0.65),
+
+    # Blenders to. De har ingen oppskrift aa hente tall fra, saa disse er
+    # lest av teksturene og er et anslag.
+    "bl_metal_full":  ((0.72, 0.70, 0.71), 1.00, 0.18),
+    "bl_clay_studio": ((0.82, 0.82, 0.82), 0.00, 0.85),
+
+    # De trinnvise har ingen PBR-ekvivalent; poenget deres er nettopp at
+    # de ikke er fysiske. Vi gjengir dem som matt maling i grunnfargen.
+    "toon_paper": ((0.88, 0.87, 0.84), 0.00, 0.80),
+    "toon_sky":   ((0.62, 0.72, 0.84), 0.00, 0.80),
+    "toon_clay":  ((0.80, 0.60, 0.46), 0.00, 0.80),
+}
+
+STANDARD_MATERIALE = (None, 0.0, 0.45)   # None = bruk objektets ShapeColor
 BAKGRUNN = (0.86, 0.87, 0.89)
 
 
@@ -339,6 +370,23 @@ def tessellate(obj, tol=TOLERANSE):
     return (pos[flat].astype(np.float32), nrm[flat].astype(np.float32))
 
 
+def material_for(obj):
+    """Finner materialet for et objekt.
+
+    Foerst MatCap-valget hvis det finnes, ellers objektets egen farge
+    med noeytrale verdier. Da ser en modell uten MatCap fortsatt riktig
+    ut, bare uten materialkarakter.
+    """
+    navn = getattr(obj.ViewObject, "MatCapMaterial", "") or ""
+    oppslag = MATERIALER.get(navn)
+    if oppslag is not None:
+        return oppslag
+    farge, met, rgh = STANDARD_MATERIALE
+    if farge is None:
+        farge = tuple(obj.ViewObject.ShapeColor[:3])
+    return farge, met, rgh
+
+
 def ground_plane(bbox, vekst=3.0):
     """Et gulv under modellen, saa den staar paa noe."""
     cx = 0.5 * (bbox.XMin + bbox.XMax)
@@ -473,8 +521,8 @@ class PbrViewport(QtOpenGLWidgets.QOpenGLWidget):
             data = tessellate(obj)
             if data is None:
                 continue
-            farge = tuple(obj.ViewObject.ShapeColor[:3])
-            self.pending.append((data, farge, 0.0, 0.45))
+            farge, met, rgh = material_for(obj)
+            self.pending.append((data, farge, met, rgh))
             bbox = obj.Shape.BoundBox if bbox is None else bbox
             antall += 1
         if bbox is not None:
