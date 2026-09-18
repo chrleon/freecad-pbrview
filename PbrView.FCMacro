@@ -41,7 +41,8 @@ from PySide6 import QtCore, QtGui, QtOpenGL, QtOpenGLWidgets
 
 TOLERANSE = 0.05        # tesselering, millimeter
 
-# Materialene fra MatCap-addonen, som PBR-parametre.
+# Reservetabell for dokumenter uten materialkort. Kilden er
+# ShapeMaterial med Disney-modellen; dette er bare et fallback.
 #
 # Dette er ikke gjetninger etter oeyemaal: matcap-teksturene ble
 # generert fra nettopp disse tallene. Teksturen og denne rendringen er
@@ -370,17 +371,67 @@ def tessellate(obj, tol=TOLERANSE):
     return (pos[flat].astype(np.float32), nrm[flat].astype(np.float32))
 
 
-def material_for(obj):
-    """Finner materialet for et objekt.
+DISNEY_UUID = "f8723572-4470-4c39-a749-6d3b71358a5b"
 
-    Foerst MatCap-valget hvis det finnes, ellers objektets egen farge
-    med noeytrale verdier. Da ser en modell uten MatCap fortsatt riktig
-    ut, bare uten materialkarakter.
+
+def _les_farge(verdi):
+    """Tolker en fargeverdi fra et materialkort.
+
+    Kortene lagrer farger som strengen "(r, g, b, a)", men API-et gir
+    noen ganger en ferdig tuppel. Begge maa taales.
     """
+    if verdi is None:
+        return None
+    if isinstance(verdi, (tuple, list)):
+        return tuple(float(c) for c in verdi[:3])
+    tekst = str(verdi).strip().strip("()")
+    deler = [d for d in tekst.replace(",", " ").split() if d]
+    if len(deler) < 3:
+        return None
+    try:
+        return tuple(float(d) for d in deler[:3])
+    except ValueError:
+        return None
+
+
+def material_for(obj):
+    """Finner materialet for et objekt, i prioritert rekkefoelge.
+
+    1. ShapeMaterial med Disney-modellen. Det er FreeCADs eget
+       materialsystem, det lagres i fila, og Render-arbeidsbenken leser
+       det samme. Dette er kilden naar den finnes.
+    2. ShapeMaterial med bare grunnleggende rendering, altsaa en
+       diffus farge uten metall og ruhet.
+    3. Navnet MatCap skrev, slaatt opp i tabellen her. Fanger opp
+       dokumenter laget foer kortene fantes.
+    4. Objektets ShapeColor, med noeytrale verdier.
+    """
+    mat = getattr(obj, "ShapeMaterial", None)
+    if mat is not None:
+        try:
+            if mat.hasAppearanceModel(DISNEY_UUID):
+                base = _les_farge(
+                    mat.getAppearanceValue("Render.Disney.BaseColor"))
+                met = float(mat.getAppearanceValue("Render.Disney.Metallic"))
+                rgh = float(mat.getAppearanceValue("Render.Disney.Roughness"))
+                if base is not None:
+                    return base, met, rgh
+        except Exception:
+            pass
+        try:
+            base = _les_farge(mat.getAppearanceValue("DiffuseColor"))
+            if base is not None and mat.Name != "Default":
+                skinn = mat.getAppearanceValue("Shininess")
+                rgh = 1.0 - float(skinn) if skinn is not None else 0.45
+                return base, 0.0, max(0.05, min(1.0, rgh))
+        except Exception:
+            pass
+
     navn = getattr(obj.ViewObject, "MatCapMaterial", "") or ""
     oppslag = MATERIALER.get(navn)
     if oppslag is not None:
         return oppslag
+
     farge, met, rgh = STANDARD_MATERIALE
     if farge is None:
         farge = tuple(obj.ViewObject.ShapeColor[:3])

@@ -40,8 +40,14 @@ midtknappen for å panorere, rull for å zoome.
 ## Materialer fra MatCap
 
 Velger du et materiale i [MatCap](https://github.com/chrleon/freecad-matcap),
-skriver den navnet til egenskapen `MatCapMaterial` på objektet, og den
-lagres i FCStd-fila. PbrView leser navnet og slår opp PBR-parametrene.
+setter den objektets `ShapeMaterial` til et FreeCAD-materialkort med
+Disney-modellen, altså Principled BSDF. PbrView leser BaseColor, Metallic
+og Roughness derfra.
+
+Det er FreeCADs eget materialsystem, ikke noe vi fant på. Materialet
+lagres i FCStd-fila, vises i modelltreet, og Render-arbeidsbenken leser
+den samme modellen. Uten et kort faller PbrView tilbake på en enkel
+diffus farge, så på navnet MatCap skrev, og til slutt på `ShapeColor`.
 
 **Oppslaget er eksakt, ikke et anslag.** Matcap-teksturene ble generert
 fra nettopp disse tallene, så teksturen og denne rendringen er to
